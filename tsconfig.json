@@ -1,27 +1,81 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// tsconfig.json — TypeScript compiler configuration
+//
+// TypeScript supports JSON-with-comments (JSONC) for config files, so the
+// `//` lines below are legal here. They are NOT legal in package.json.
+//
+// HOW THIS IS USED: when you run `next dev` / `next build`, Next.js invokes
+// the TypeScript compiler to type-check your code. `tsc` itself does NOT emit
+// JS in this project (see `noEmit: true`); SWC (Next's Rust-based compiler)
+// does the actual transpilation. tsc's only job here is to catch type errors.
+// ─────────────────────────────────────────────────────────────────────────────
 {
   "compilerOptions": {
+    // Target ES version for emitted JS. ES2017 = async/await native, no
+    // polyfill bloat. Next/SWC will further down-level for older browsers.
     "target": "ES2017",
+
+    // Which global type definitions to include. `dom` gives us `document`,
+    // `window`, `fetch`, etc.; `esnext` gives bleeding-edge JS types
+    // (Array.prototype.findLast, structuredClone, etc.).
     "lib": ["dom", "dom.iterable", "esnext"],
+
+    // Let plain `.js` files coexist with `.ts` if we ever drop one in.
     "allowJs": true,
+
+    // Skip type-checking inside node_modules. Massive speed win — we trust
+    // library authors to ship correct types.
     "skipLibCheck": true,
+
+    // The big one. `strict: true` enables a bundle of safety flags:
+    // noImplicitAny, strictNullChecks, strictFunctionTypes, etc. Keep this on.
     "strict": true,
+
+    // Don't emit .js files — Next/SWC handles transpilation. tsc just lints.
     "noEmit": true,
+
+    // Smooth over CommonJS/ESM interop so `import x from 'cjs-pkg'` works.
     "esModuleInterop": true,
+
+    // Use ES module syntax (import/export). `bundler` resolution mirrors how
+    // Next/Webpack/Turbopack actually find files — most accurate option for
+    // a bundled app.
     "module": "esnext",
     "moduleResolution": "bundler",
+
+    // Allow `import data from './foo.json'` — handy for static fixtures.
     "resolveJsonModule": true,
+
+    // Each file is compiled independently (needed by SWC/Babel-style bundlers
+    // that don't see the whole project at once). Forces a few small constraints
+    // like requiring `export type` when re-exporting types.
     "isolatedModules": true,
+
+    // `react-jsx` = the modern JSX transform (no `import React from 'react'`
+    // needed in every file). Standard since React 17.
     "jsx": "react-jsx",
+
+    // Cache type-check results between runs in .tsbuildinfo for speed.
     "incremental": true,
+
+    // Plugins extend the language service. `next` adds Next-aware hints in
+    // editors (e.g. warns if you `import` a server-only module from a client
+    // component).
     "plugins": [
       {
         "name": "next"
       }
     ],
+
+    // Path aliases. `@/foo/bar` resolves to `./src/foo/bar`. Saves you from
+    // `../../../components/Foo` ladders in deep files.
     "paths": {
       "@/*": ["./src/*"]
     }
   },
+
+  // Which files participate in type-checking. The .next/types entries are
+  // auto-generated route-type files Next drops during dev.
   "include": [
     "next-env.d.ts",
     "**/*.ts",
