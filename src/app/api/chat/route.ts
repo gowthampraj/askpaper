@@ -30,6 +30,8 @@
 // FEELS dramatically faster. Same trick ChatGPT, Claude.ai, etc. use.
 // ─────────────────────────────────────────────────────────────────────────────
 
+import { retrieveTopK } from "@/lib/retrieve";
+
 type Message = {
   role: "user" | "assistant" | "system";
   content: string;
@@ -39,12 +41,41 @@ type ChatRequest = {
   messages: Message[];
 };
 
-const SYSTEM_PROMPT = `You are Askpaper, an assistant that helps users explore and understand PDF documents.
+// Base system prompt — applied every request. Retrieved PDF context (when
+// there is any) gets appended at runtime by buildSystemPrompt().
+const BASE_SYSTEM_PROMPT = `You are Askpaper, an assistant that helps users explore and understand PDF documents.
 
 Guidelines:
 - Keep replies concise and direct. Avoid filler like "I'm here to help" or "Feel free to ask".
 - If you don't know something, say so plainly.
-- When PDF content is provided in context (coming in Week 2), ground your answers in it and cite the source.`;
+- When PDF context is provided below, prefer information from it. Cite the source filename when you do.
+- If the PDF context doesn't cover the question, say so before answering from general knowledge.`;
+
+/**
+ * Build the final system prompt for this turn. If we retrieved relevant
+ * chunks from any uploaded PDF, append them as a clearly-delimited block.
+ * Otherwise just return the base prompt unchanged.
+ */
+function buildSystemPrompt(
+  retrieved: { text: string; filename: string; score: number }[],
+): string {
+  if (retrieved.length === 0) return BASE_SYSTEM_PROMPT;
+
+  const contextBlock = retrieved
+    .map(
+      (c, i) =>
+        `--- Chunk ${i + 1} (source: ${c.filename}, similarity: ${c.score.toFixed(3)}) ---\n${c.text}`,
+    )
+    .join("\n\n");
+
+  return `${BASE_SYSTEM_PROMPT}
+
+---
+RETRIEVED PDF CONTEXT (use this to answer the user's latest question):
+
+${contextBlock}
+---`;
+}
 
 // Validate body. Clients can only send user/assistant turns — server is the
 // sole source of system messages (prompt-injection defence).
@@ -81,8 +112,32 @@ export async function POST(req: Request) {
     return Response.json({ error: "Server misconfigured" }, { status: 500 });
   }
 
+  // ─── RAG: retrieve relevant chunks for the LATEST user message ──────────
+  // We retrieve based on just the latest user turn rather than the whole
+  // history. For follow-up questions this is sometimes wrong ("explain that
+  // more" — what's "that"?), but rewriting the query with context is a
+  // Week 4 problem. For Week 2, single-turn retrieval is plenty.
+  const latestUserMsg = [...body.messages]
+    .reverse()
+    .find((m) => m.role === "user");
+  const retrieved = latestUserMsg
+    ? await retrieveTopK(latestUserMsg.content, 4)
+    : [];
+
+  // Log what we retrieved so we can debug from the dev-server terminal.
+  if (retrieved.length > 0) {
+    console.log(
+      `[retrieve] top ${retrieved.length} chunks for "${latestUserMsg!.content.slice(0, 60)}..."`,
+    );
+    retrieved.forEach((r, i) => {
+      console.log(
+        `  ${i + 1}. ${r.filename}#${r.chunkIndex} (${r.score.toFixed(3)}): ${r.text.slice(0, 80).replace(/\n/g, " ")}...`,
+      );
+    });
+  }
+
   const messagesForGroq: Message[] = [
-    { role: "system", content: SYSTEM_PROMPT },
+    { role: "system", content: buildSystemPrompt(retrieved) },
     ...body.messages,
   ];
 

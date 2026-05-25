@@ -19,7 +19,7 @@
 
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 
 // One message in the chat log. We keep the shape close to what Groq/OpenAI
 // expect so we can hand the array straight to the API in Task 5 (memory).
@@ -28,12 +28,72 @@ type Message = {
   content: string;
 };
 
+// Summary of one uploaded PDF (subset of what /api/upload returns).
+type UploadedDoc = {
+  filename: string;
+  chunkCount: number;
+  charCount: number;
+};
+
 export default function Home() {
-  // Three pieces of UI state. Each `useState` returns [value, setter].
-  // React re-renders the component whenever a setter is called with a new value.
+  // Chat state.
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+
+  // Upload state.
+  const [uploads, setUploads] = useState<UploadedDoc[]>([]);
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  // `useRef` holds a reference to a DOM node across renders without
+  // triggering a re-render when it changes. We use it to trigger the
+  // hidden file input from a styled button (the native input is ugly).
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Triggered when the user picks a file in the hidden <input type="file">.
+  async function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    // Reset the input value so picking the SAME file twice in a row still
+    // fires the change event (browsers suppress it otherwise).
+    e.target.value = "";
+    if (!file) return;
+
+    setUploadError(null);
+    setUploading(true);
+
+    try {
+      // multipart/form-data is the native way to send a file. The browser
+      // sets the Content-Type header (with the boundary) automatically when
+      // you pass a FormData to fetch — DON'T set it manually.
+      const formData = new FormData();
+      formData.append("file", file);
+
+      const res = await fetch("/api/upload", {
+        method: "POST",
+        body: formData,
+      });
+      const data = await res.json();
+
+      if (!res.ok) {
+        throw new Error(data?.error ?? `Upload failed (${res.status})`);
+      }
+
+      // Replace any existing entry for the same filename — re-uploading
+      // overwrites in the server's store, so the UI should match.
+      setUploads((prev) => [
+        ...prev.filter((u) => u.filename !== data.filename),
+        {
+          filename: data.filename,
+          chunkCount: data.chunkCount,
+          charCount: data.charCount,
+        },
+      ]);
+    } catch (err) {
+      setUploadError(err instanceof Error ? err.message : "Upload failed");
+    } finally {
+      setUploading(false);
+    }
+  }
 
   // Submit handler. Async because we await the fetch. Typed as a React form
   // event so TypeScript knows `e.preventDefault()` exists.
@@ -112,8 +172,6 @@ export default function Home() {
           <h1 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100">
             Askpaper
           </h1>
-          {/* Reset button — wipes client state. Server has nothing to clear
-              because it stores no history (see route.ts comments). */}
           <button
             type="button"
             onClick={() => setMessages([])}
@@ -157,28 +215,94 @@ export default function Home() {
         )}
       </main>
 
-      {/* Input bar pinned at the bottom. `sticky bottom-0` keeps it visible
-          when the message list grows past the viewport. */}
+      {/* Composer — file chips on top, input row on bottom. Matches the
+          standard ChatGPT/Claude pattern: attach button left, text input
+          centre, send button right. Pinned to the viewport bottom. */}
       <form
         onSubmit={handleSubmit}
         className="sticky bottom-0 border-t border-zinc-200 bg-white px-4 py-3 dark:border-zinc-800 dark:bg-zinc-950"
       >
-        <div className="mx-auto flex max-w-3xl gap-2">
+        <div className="mx-auto max-w-3xl">
+          {/* Hidden native file input. Triggered by the paperclip button. */}
           <input
-            type="text"
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            placeholder="Type a message…"
-            disabled={loading}
-            className="flex-1 rounded-full border border-zinc-300 bg-white px-4 py-2 text-sm text-zinc-900 outline-none focus:border-zinc-500 disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
+            ref={fileInputRef}
+            type="file"
+            accept="application/pdf,.pdf"
+            onChange={handleFileChange}
+            className="hidden"
           />
-          <button
-            type="submit"
-            disabled={loading || !input.trim()}
-            className="rounded-full bg-zinc-900 px-4 py-2 text-sm font-medium text-white transition hover:bg-zinc-700 disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
-          >
-            Send
-          </button>
+
+          {/* Uploaded-file chips + any upload error. Sit just above the
+              input row so they feel like attachments to the next message. */}
+          {(uploads.length > 0 || uploadError || uploading) && (
+            <div className="mb-2 flex flex-wrap items-center gap-2 text-xs">
+              {uploads.map((u) => (
+                <span
+                  key={u.filename}
+                  className="inline-flex items-center gap-1.5 rounded-full bg-zinc-100 px-2.5 py-1 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300"
+                  title={`${u.charCount.toLocaleString()} chars, ${u.chunkCount} chunks`}
+                >
+                  <span aria-hidden>📄</span>
+                  <span className="max-w-[200px] truncate">{u.filename}</span>
+                  <span className="text-zinc-500">· {u.chunkCount} chunks</span>
+                </span>
+              ))}
+              {uploading && (
+                <span className="text-zinc-500">Uploading & indexing…</span>
+              )}
+              {uploadError && (
+                <span className="text-amber-600 dark:text-amber-400">
+                  ⚠️ {uploadError}
+                </span>
+              )}
+            </div>
+          )}
+
+          {/* Input row. The attach button is a sibling of the text input,
+              styled as an icon-only round button on the left. */}
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={uploading || loading}
+              title="Upload PDF"
+              aria-label="Upload PDF"
+              className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-zinc-300 bg-white text-zinc-600 transition hover:border-zinc-400 hover:text-zinc-900 disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100"
+            >
+              {/* Inline paperclip SVG — avoids an icon dependency. The
+                  d-string is from Lucide's "paperclip" glyph. */}
+              <svg
+                width="18"
+                height="18"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden
+              >
+                <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+              </svg>
+            </button>
+
+            <input
+              type="text"
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              placeholder="Type a message…"
+              disabled={loading}
+              className="flex-1 rounded-full border border-zinc-300 bg-white px-4 py-2 text-sm text-zinc-900 outline-none focus:border-zinc-500 disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
+            />
+
+            <button
+              type="submit"
+              disabled={loading || !input.trim()}
+              className="rounded-full bg-zinc-900 px-4 py-2 text-sm font-medium text-white transition hover:bg-zinc-700 disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
+            >
+              Send
+            </button>
+          </div>
         </div>
       </form>
     </div>
