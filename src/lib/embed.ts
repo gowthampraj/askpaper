@@ -20,7 +20,28 @@
 // requests in the same instance are fast.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { pipeline, type FeatureExtractionPipeline } from "@xenova/transformers";
+import {
+  pipeline,
+  env as transformersEnv,
+  type FeatureExtractionPipeline,
+} from "@xenova/transformers";
+
+// VERCEL CACHE-DIR FIX:
+//   @xenova/transformers caches downloaded models to disk so subsequent
+//   loads are instant. By default it picks a path relative to the package
+//   in node_modules. On Vercel, every directory except /tmp is read-only,
+//   so the default cache write fails and the lib falls back to slower
+//   in-memory loading on every cold start (or, depending on version,
+//   crashes). Pointing it at /tmp/transformers makes the cache work
+//   throughout the lifetime of a warm function instance. Cold starts will
+//   still re-download (since /tmp doesn't persist across instances), but
+//   warm requests are fast.
+//
+//   We only override in production — locally we want the cache in
+//   node_modules so it survives `next dev` restarts.
+if (process.env.NODE_ENV === "production") {
+  transformersEnv.cacheDir = "/tmp/transformers";
+}
 
 // Same globalThis trick as the document store — survives hot reloads in
 // `next dev` so we don't re-download the model every time you save a file.

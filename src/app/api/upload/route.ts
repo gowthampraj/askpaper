@@ -24,6 +24,12 @@ import { saveDocument } from "@/lib/store";
 import { chunkText } from "@/lib/chunk";
 import { embedMany } from "@/lib/embed";
 
+// Vercel function timeout. Default is 10s; first upload after cold start
+// has to download the ~25 MB embedding model from Hugging Face's CDN AND
+// embed ~100 chunks, easily 30-60s. Hobby tier caps maxDuration at 60.
+// Pro/Enterprise allow up to 800s.
+export const maxDuration = 60;
+
 const MAX_BYTES = 5 * 1024 * 1024; // 5 MB
 
 export async function POST(req: Request) {
