@@ -120,13 +120,22 @@ export async function POST(req: Request) {
     embedding: embeddings[i],
   }));
 
-  // 6. Save to the in-memory store.
-  saveDocument({
-    filename: file.name,
-    text,
-    chunks,
-    uploadedAt: new Date(),
-  });
+  // 6. Persist to Postgres. saveDocument is async now (DB I/O) — we MUST
+  //    await or the route would return success before the rows land.
+  try {
+    await saveDocument({
+      filename: file.name,
+      text,
+      chunks,
+      uploadedAt: new Date(),
+    });
+  } catch (err) {
+    console.error("Save to DB failed:", err);
+    return Response.json(
+      { error: "Failed to persist document. Check server logs." },
+      { status: 500 },
+    );
+  }
 
   // 7. Summary for the client.
   return Response.json({

@@ -21,11 +21,23 @@
 
 import { useRef, useState } from "react";
 
+// One retrieved chunk surfaced as a source for an assistant answer. Mirrors
+// the RetrievedChunk shape on the server (src/lib/retrieve.ts).
+type SourceChunk = {
+  text: string;
+  score: number;
+  filename: string;
+  chunkIndex: number;
+};
+
 // One message in the chat log. We keep the shape close to what Groq/OpenAI
-// expect so we can hand the array straight to the API in Task 5 (memory).
+// expect so we can hand the array straight to the API. The optional
+// `sources` field captures the RAG chunks that informed an assistant
+// reply; user messages never have sources.
 type Message = {
   role: "user" | "assistant";
   content: string;
+  sources?: SourceChunk[];
 };
 
 // Summary of one uploaded PDF (subset of what /api/upload returns).
@@ -34,6 +46,54 @@ type UploadedDoc = {
   chunkCount: number;
   charCount: number;
 };
+
+/**
+ * Collapsible "Sources" disclosure rendered under an assistant message.
+ *
+ * Uses the native <details>/<summary> elements: free expand/collapse
+ * behavior, free keyboard accessibility, no state, no library. The list is
+ * collapsed by default — chats stay clean and the user opts in when they
+ * want to verify what the model saw.
+ *
+ * Each card surfaces three things, because that's what tells the user
+ * whether to TRUST the answer:
+ *   - filename     → which document it came from
+ *   - chunk index  → roughly where in the document
+ *   - score        → how confident the retriever was (higher = more
+ *                    semantically similar to the question)
+ * The chunk text itself is shown line-clamped to 3 lines so the disclosure
+ * doesn't blow up the page; users can mentally expand by re-uploading or
+ * opening the PDF directly.
+ */
+function Sources({ sources }: { sources: SourceChunk[] }) {
+  return (
+    <details className="mt-2 ml-1 text-xs">
+      <summary className="cursor-pointer select-none text-zinc-500 hover:text-zinc-700 dark:text-zinc-400 dark:hover:text-zinc-200">
+        Sources ({sources.length})
+      </summary>
+      <ul className="mt-2 space-y-2">
+        {sources.map((s, i) => (
+          <li
+            key={i}
+            className="rounded-lg border border-zinc-200 bg-zinc-50 p-2 dark:border-zinc-800 dark:bg-zinc-950"
+          >
+            <div className="mb-1 flex items-center justify-between gap-2 text-zinc-600 dark:text-zinc-400">
+              <span className="truncate font-medium" title={s.filename}>
+                {s.filename}
+              </span>
+              <span className="shrink-0 font-mono text-[10px]">
+                #{s.chunkIndex} · {s.score.toFixed(3)}
+              </span>
+            </div>
+            <p className="line-clamp-3 whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-zinc-700 dark:text-zinc-300">
+              {s.text}
+            </p>
+          </li>
+        ))}
+      </ul>
+    </details>
+  );
+}
 
 export default function Home() {
   // Chat state.
@@ -126,32 +186,80 @@ export default function Home() {
 
       if (!res.ok || !res.body) throw new Error(`API ${res.status}`);
 
-      // 3. STREAMING: server emits plain text chunks (the model's tokens as
-      //    they're generated). We append a placeholder assistant message
-      //    first, then mutate its content as each chunk arrives. React
-      //    re-renders on every setMessages call → the bubble visibly grows.
+      // 3. STREAMING: server emits NDJSON — one JSON event per line. We
+      //    push a placeholder assistant message and update it as events
+      //    arrive:
+      //      - "sources" event → attach retrieved chunks to the message
+      //      - "delta"   event → append text to the message content
+      //      - "done"    event → stream finished cleanly
+      //      - "error"   event → upstream failure; show the error in-line
       setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
 
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
+      // Reads can split a JSON line across packets, so we buffer bytes and
+      // only parse lines we know are complete (ended with "\n").
+      let buffer = "";
+      let streamDone = false;
 
-      while (true) {
+      while (!streamDone) {
         const { done, value } = await reader.read();
         if (done) break;
-        const chunk = decoder.decode(value, { stream: true });
+        buffer += decoder.decode(value, { stream: true });
 
-        // Append `chunk` to the LAST message (the assistant placeholder).
-        // We use the functional form of setMessages so we don't depend on
-        // a stale closure over `messages`.
-        setMessages((prev) => {
-          const next = prev.slice();
-          const last = next[next.length - 1];
-          next[next.length - 1] = {
-            ...last,
-            content: last.content + chunk,
-          };
-          return next;
-        });
+        const lines = buffer.split("\n");
+        // The last element is whatever came after the final "\n" — either
+        // empty (clean break) or a partial line we'll finish next read.
+        buffer = lines.pop() ?? "";
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          let event: { type: string; [k: string]: unknown };
+          try {
+            event = JSON.parse(line);
+          } catch {
+            // Malformed line — skip rather than killing the whole stream.
+            continue;
+          }
+
+          if (event.type === "sources") {
+            const sources = event.sources as SourceChunk[];
+            setMessages((prev) => {
+              const next = prev.slice();
+              next[next.length - 1] = {
+                ...next[next.length - 1],
+                sources,
+              };
+              return next;
+            });
+          } else if (event.type === "delta") {
+            const text = event.text as string;
+            setMessages((prev) => {
+              const next = prev.slice();
+              const last = next[next.length - 1];
+              next[next.length - 1] = {
+                ...last,
+                content: last.content + text,
+              };
+              return next;
+            });
+          } else if (event.type === "error") {
+            const errMsg = (event.error as string) ?? "Stream error";
+            setMessages((prev) => {
+              const next = prev.slice();
+              next[next.length - 1] = {
+                ...next[next.length - 1],
+                content: `⚠️ ${errMsg}`,
+              };
+              return next;
+            });
+            streamDone = true;
+            break;
+          } else if (event.type === "done") {
+            streamDone = true;
+            break;
+          }
+        }
       }
     } catch (err) {
       console.error(err);
@@ -195,18 +303,30 @@ export default function Home() {
         {messages.map((m, i) => (
           // `key` helps React diff lists efficiently. Index is fine here
           // because we only append (never reorder/delete).
+          // Outer wrapper holds the bubble plus the optional Sources
+          // disclosure below it — both share the same max-width and side
+          // alignment so the disclosure visually belongs to the bubble.
           <div
             key={i}
             className={
-              m.role === "user"
-                ? "ml-auto max-w-[80%] rounded-2xl bg-zinc-900 px-4 py-2 text-white dark:bg-zinc-100 dark:text-zinc-900"
-                : "mr-auto max-w-[80%] rounded-2xl bg-white px-4 py-2 text-zinc-900 shadow-sm dark:bg-zinc-900 dark:text-zinc-100"
+              m.role === "user" ? "ml-auto max-w-[80%]" : "mr-auto max-w-[80%]"
             }
           >
-            {/* whitespace-pre-wrap preserves newlines from the model's reply */}
-            <p className="whitespace-pre-wrap text-sm leading-relaxed">
-              {m.content}
-            </p>
+            <div
+              className={
+                m.role === "user"
+                  ? "rounded-2xl bg-zinc-900 px-4 py-2 text-white dark:bg-zinc-100 dark:text-zinc-900"
+                  : "rounded-2xl bg-white px-4 py-2 text-zinc-900 shadow-sm dark:bg-zinc-900 dark:text-zinc-100"
+              }
+            >
+              {/* whitespace-pre-wrap preserves newlines from the model's reply */}
+              <p className="whitespace-pre-wrap text-sm leading-relaxed">
+                {m.content}
+              </p>
+            </div>
+            {m.role === "assistant" && m.sources && m.sources.length > 0 && (
+              <Sources sources={m.sources} />
+            )}
           </div>
         ))}
 

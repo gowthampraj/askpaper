@@ -5,22 +5,36 @@
 //
 // FLOW:
 //   1. Browser POSTs { messages: [...] }
-//   2. We call Groq with `stream: true`. Groq returns a long-lived HTTP
+//   2. We run RAG retrieval on the latest user message to find top-K chunks.
+//   3. We call Groq with `stream: true`. Groq returns a long-lived HTTP
 //      response that emits "Server-Sent Events" — text frames shaped like
 //          data: {"choices":[{"delta":{"content":"Hel"}}]}\n\n
 //          data: {"choices":[{"delta":{"content":"lo"}}]}\n\n
 //          data: [DONE]\n\n
 //      one per generated chunk.
-//   3. We read Groq's stream, parse each frame, and write JUST the text
-//      ("Hel", then "lo") to OUR response body as plain text.
-//   4. Browser reads our response progressively and appends each chunk to
-//      the assistant message bubble.
+//   4. We translate Groq's SSE into NDJSON (newline-delimited JSON) for our
+//      own client. Each line is a complete JSON object with a `type` field:
+//          {"type":"sources","sources":[...]}        — emitted once, first
+//          {"type":"delta","text":"Hel"}             — many of these
+//          {"type":"delta","text":"lo"}
+//          {"type":"done"}                            — emitted once, last
+//          {"type":"error","error":"..."}            — only on failure
+//   5. Browser reads our response line by line, attaches the sources to the
+//      assistant message, and appends each delta to the visible reply.
 //
-// WHY DO WE PARSE/RE-EMIT INSTEAD OF JUST PIPING GROQ'S STREAM THROUGH?
-//   Two reasons:
+// WHY NDJSON INSTEAD OF PLAIN TEXT?
+//   Plain text was fine when all we sent was reply tokens. But once we also
+//   want to send the retrieved chunks (and later, tool-call traces), we
+//   need a way to multiplex multiple kinds of events over the same stream.
+//   NDJSON is the simplest wire format that does this — one JSON per line,
+//   parse with a line-split. It's the protocol the Vercel AI SDK and most
+//   LLM-streaming clients converged on for exactly this reason.
+//
+// WHY PARSE/RE-EMIT INSTEAD OF JUST PIPING GROQ'S STREAM THROUGH?
 //     - Keeps the client decoupled from Groq's wire format. If we switch
 //       providers later (OpenAI, Anthropic, local Ollama), the client
-//       doesn't care — it just keeps reading plain text.
+//       doesn't care — it just keeps reading the same NDJSON event types.
+//     - Lets us inject our own events (sources here, tool calls later).
 //     - Lets us strip out metadata we don't want exposed (token usage,
 //       model fingerprints, system prompt echoes).
 //
@@ -136,9 +150,20 @@ export async function POST(req: Request) {
     });
   }
 
+  // Project each incoming message down to just { role, content } before
+  // forwarding to Groq. The client may attach extra fields (e.g. `sources`
+  // on assistant messages, for our own UI), and Groq rejects any unknown
+  // property with a 400. Doing this on the server makes us the single point
+  // that decides what shape upstream sees, regardless of what the client
+  // sends.
+  const sanitized: Message[] = body.messages.map((m) => ({
+    role: m.role,
+    content: m.content,
+  }));
+
   const messagesForGroq: Message[] = [
     { role: "system", content: buildSystemPrompt(retrieved) },
-    ...body.messages,
+    ...sanitized,
   ];
 
   // 2. Call Groq with stream: true. Note we do NOT `await groqRes.json()` or
@@ -168,12 +193,27 @@ export async function POST(req: Request) {
 
   // 3. Build OUR response stream. ReadableStream is the Web Standard way to
   //    create a streaming HTTP body. The `start` function runs immediately
-  //    and pushes data into the stream via `controller.enqueue(...)`.
+  //    and pushes data into the stream via `controller.enqueue(...)`. We
+  //    emit one JSON object per line — see the file-top docblock for the
+  //    event shapes.
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
+      // Tiny helper: serialize one event object as a single NDJSON line.
+      // JSON.stringify takes care of escaping any newlines inside string
+      // fields, so the literal "\n" we append is guaranteed to be a real
+      // record separator — not something a chunk's text could spoof.
+      const writeEvent = (event: object) => {
+        controller.enqueue(encoder.encode(JSON.stringify(event) + "\n"));
+      };
+
+      // FIRST event: the retrieved chunks (possibly empty). Emitting this
+      // BEFORE any delta lets the client render the "Sources" panel as
+      // soon as it knows what's available, in parallel with token streaming.
+      writeEvent({ type: "sources", sources: retrieved });
+
       const reader = groqRes.body!.getReader();
       // SSE frames are delimited by blank lines. A single TCP packet from
       // Groq can contain a partial frame or multiple frames glued together,
@@ -199,38 +239,52 @@ export async function POST(req: Request) {
             if (!line.startsWith("data:")) continue;
             const payload = line.slice(5).trim();
             if (payload === "[DONE]") {
+              writeEvent({ type: "done" });
               controller.close();
               return;
             }
 
             // Each chunk is JSON shaped like Groq/OpenAI's streaming format.
-            // We only care about the text delta.
+            // We only care about the text delta — wrap it in our own event
+            // type so the client doesn't have to know Groq's schema.
             try {
               const json = JSON.parse(payload);
               const delta: string =
                 json?.choices?.[0]?.delta?.content ?? "";
-              if (delta) controller.enqueue(encoder.encode(delta));
+              if (delta) writeEvent({ type: "delta", text: delta });
             } catch {
               // Malformed JSON in a frame — skip it rather than killing
               // the whole stream.
             }
           }
         }
+        // Groq closed the stream without [DONE] — still tell the client
+        // we're done so it can release its reader.
+        writeEvent({ type: "done" });
         controller.close();
       } catch (err) {
         console.error("Stream error:", err);
-        controller.error(err);
+        // Surface the failure as an in-band event so the client can show
+        // a real error in the chat instead of just stopping mid-reply.
+        writeEvent({
+          type: "error",
+          error: err instanceof Error ? err.message : "Stream failed",
+        });
+        controller.close();
       } finally {
         reader.releaseLock();
       }
     },
   });
 
-  // 4. Return the stream as plain text. Headers tell intermediaries (Vercel,
-  //    Cloudflare, browsers) NOT to buffer this response.
+  // 4. Return the stream as NDJSON. Headers tell intermediaries (Vercel,
+  //    Cloudflare, browsers) NOT to buffer this response — same as before.
+  //    Content-Type is the conventional MIME for newline-delimited JSON
+  //    streams; fetch() doesn't care about it either way, but it signals
+  //    intent to anything else inspecting the response.
   return new Response(stream, {
     headers: {
-      "Content-Type": "text/plain; charset=utf-8",
+      "Content-Type": "application/x-ndjson; charset=utf-8",
       "Cache-Control": "no-cache, no-transform",
       "X-Accel-Buffering": "no", // disables nginx buffering on some hosts
     },

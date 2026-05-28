@@ -1,82 +1,125 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// src/lib/retrieve.ts — find the top-K chunks most relevant to a query
+// src/lib/retrieve.ts — top-K similarity search via pgvector
 //
-// WHAT THIS DOES:
-//   1. Embed the user's query into the same 384-D vector space as our chunks.
-//   2. Score every stored chunk against it using cosine similarity.
-//   3. Sort, take the top K, return them.
+// WHAT CHANGED IN WEEK 3:
+//   The Week 2 version pulled every chunk from the in-memory Map and did
+//   the dot-product loop in JavaScript. Now the chunks live in Postgres
+//   and pgvector does the work for us — we send the query embedding to
+//   the DB and let it return the top-K rows already sorted.
 //
-// COSINE SIMILARITY SHORTCUT:
-//   Normally: similarity(a, b) = (a · b) / (||a|| * ||b||)
-//   But we set `normalize: true` in embed.ts → every vector has length 1.
-//   ||a|| = ||b|| = 1 → division becomes a no-op.
-//   So similarity collapses to just the dot product, which is the fastest
-//   way you can compare two vectors: one tight loop, no sqrt, no divide.
+// THE SQL, EXPLAINED:
 //
-// SCALE NOTE: this is a BRUTE-FORCE search — score every chunk for every
-// query. With 128 chunks it takes <1 ms. With 100k chunks it'd take ~50 ms.
-// With millions, you'd need an Approximate Nearest Neighbour index (HNSW,
-// IVF-PQ, etc.) — that's why real vector DBs exist. We'll add SQLite +
-// sqlite-vec in Week 3 for a step in that direction; for now brute force
-// is fine.
+//   SELECT
+//     filename,
+//     chunk_index,
+//     text,
+//     1 - (embedding <=> $1::vector) AS score      ← (1)
+//   FROM chunks
+//   WHERE embedding <=> $1::vector <= $2           ← (2)
+//   ORDER BY embedding <=> $1::vector ASC          ← (3)
+//   LIMIT $3                                       ← (4)
+//
+//   (1) `<=>` is pgvector's cosine-distance operator. For normalized
+//       embeddings, similarity = 1 - distance, so we convert here to
+//       match our existing [0, 1]-ish scoring convention.
+//
+//   (2) Apply the minimum-similarity threshold as a maximum-distance
+//       filter. If the caller wants minScore=0.3, we want distance<=0.7.
+//       Filtering in SQL means low-relevance chunks never leave the DB.
+//
+//   (3) Sort by raw distance ASC (= similarity DESC). This is the clause
+//       pgvector's HNSW index actually accelerates — instead of scoring
+//       every chunk, the index navigates the high-dimensional graph and
+//       skips most of them. At our current scale (~hundreds of chunks)
+//       brute force is still fast, but the index is already in place so
+//       the query plan upgrades for free when we add more documents.
+//
+//   (4) Cap the result count.
+//
+// WHY WE DON'T `SELECT embedding`:
+//   We never need the raw 384-D vector on the client. Asking for it would
+//   bloat each row with ~1.5 KB of JSON-encoded floats per result. Just
+//   project text + filename + chunk_index + score.
+//
+// EMPTY-RESULT BEHAVIOR (unchanged from Week 2):
+//   - No documents uploaded yet → 0 rows → return []
+//   - All chunks fall below threshold → 0 rows → return []
+//   Callers treat empty as "no context — just chat normally."
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { listDocuments } from "./store";
 import { embed } from "./embed";
+import { getSql, ensureSchema } from "./db";
+
+/**
+ * Default minimum cosine similarity to qualify as a "relevant" chunk.
+ * Chunks scoring below this are dropped from the result. Tune up for
+ * stricter (fewer false positives, more false negatives) or down for
+ * looser retrieval. 0 disables the filter entirely.
+ */
+export const DEFAULT_MIN_SCORE = 0.3;
 
 export type RetrievedChunk = {
   text: string;
-  score: number; // Higher = more similar. Range is [-1, 1] but normalized
-  //              embeddings from a sentence model usually score [0, 1].
+  score: number; // 1 - cosine_distance. Range is theoretically [-1, 1] but
+  //                normalized sentence embeddings practically score [0, 1].
   filename: string; // Which PDF the chunk came from
   chunkIndex: number; // Position of the chunk within that PDF
 };
 
-/** Dot product of two equal-length vectors. */
-function dot(a: number[], b: number[]): number {
-  // We assume a.length === b.length (both 384-D from the same model).
-  // Skip the safety check in the hot loop; embeddings come from a single
-  // controlled call site so a mismatch would be a programming bug, not
-  // runtime data.
-  let sum = 0;
-  for (let i = 0; i < a.length; i++) sum += a[i] * b[i];
-  return sum;
-}
-
 /**
- * Embed `query`, score every chunk in the store, return the top K.
- * Returns an empty array if no documents have been uploaded yet — callers
- * should treat that as "no context available, just chat normally."
+ * Embed `query`, run a pgvector top-K query, return the matching chunks.
+ *
+ * Returns an empty array when:
+ *   - no documents are stored, OR
+ *   - no chunk's similarity crosses minScore.
  */
 export async function retrieveTopK(
   query: string,
   k = 4,
+  minScore: number = DEFAULT_MIN_SCORE,
 ): Promise<RetrievedChunk[]> {
-  const docs = listDocuments();
-  if (docs.length === 0) return [];
+  await ensureSchema();
+  const sql = getSql();
 
-  // Embed the question using the SAME model as the chunks. This is the
-  // step that makes everything compatible — same vector space, same
-  // dimensionality, same "axes".
+  // Embed the question using the SAME model that produced the chunk
+  // embeddings (all-MiniLM-L6-v2). Same model → same vector space → the
+  // numbers are comparable. Different model would produce gibberish
+  // similarities even between identical text.
   const queryEmbedding = await embed(query);
 
-  // Brute-force scoring. Build a flat list of (chunk, score) pairs across
-  // all documents.
-  const scored: RetrievedChunk[] = [];
-  for (const doc of docs) {
-    doc.chunks.forEach((chunk, chunkIndex) => {
-      // Defensive: skip chunks with no embedding (shouldn't happen post-Task 20)
-      if (chunk.embedding.length === 0) return;
-      scored.push({
-        text: chunk.text,
-        score: dot(queryEmbedding, chunk.embedding),
-        filename: doc.filename,
-        chunkIndex,
-      });
-    });
-  }
+  // pgvector accepts vectors as their textual literal form: "[0.1,0.2,...]".
+  // We then cast with ::vector in SQL.
+  const queryVec = `[${queryEmbedding.join(",")}]`;
 
-  // Highest score first.
-  scored.sort((a, b) => b.score - a.score);
-  return scored.slice(0, k);
+  // Distance threshold corresponding to the similarity threshold the
+  // caller asked for. score = 1 - distance  →  distance = 1 - score.
+  const maxDistance = 1 - minScore;
+
+  const rows = await sql<
+    {
+      filename: string;
+      chunkIndex: number;
+      text: string;
+      score: number;
+    }[]
+  >`
+    SELECT
+      filename,
+      chunk_index                            AS "chunkIndex",
+      text,
+      1 - (embedding <=> ${queryVec}::vector) AS score
+    FROM chunks
+    WHERE embedding <=> ${queryVec}::vector <= ${maxDistance}
+    ORDER BY embedding <=> ${queryVec}::vector ASC
+    LIMIT ${k}
+  `;
+
+  // postgres-js returns numeric columns as JS numbers already, so no
+  // parsing needed. Just hand back as RetrievedChunk[].
+  return rows.map((r) => ({
+    filename: r.filename,
+    chunkIndex: r.chunkIndex,
+    text: r.text,
+    score: r.score,
+  }));
 }
